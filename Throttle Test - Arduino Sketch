@@ -1,0 +1,48 @@
+// Throttle-only test: Cube PWM in → Nano → EZkontrol PWM out
+// D5 = PWM in from Cube MAIN-OUT 3
+// D9 = PWM out to EZkontrol throttle
+
+#define PWM_IN   5
+#define PWM_OUT  9
+
+#define THROTTLE_MIN_PWM  51    // ~1.0V floor (EZkontrol deadband)
+#define THROTTLE_MAX_PWM  255   // 5V max
+#define DEADBAND_US       30    // ignore tiny stick offsets near center
+// TEST SKETCH FOR THE THROTTLE 
+void setup() {
+  pinMode(PWM_IN, INPUT);
+  pinMode(PWM_OUT, OUTPUT);
+  analogWrite(PWM_OUT, 0);
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("Throttle test ready. Output starts at 0.");
+}
+
+void loop() {
+  int pwmIn = pulseIn(PWM_IN, HIGH, 25000);
+
+  // Failsafe: no signal -> throttle off
+  if (pwmIn == 0) {
+    analogWrite(PWM_OUT, 0);
+    Serial.println("No signal -- throttle 0");
+    delay(20);
+    return;
+  }
+
+  int out = 0;
+
+  // Forward only: 1500us neutral, 2000us full forward
+  if (pwmIn > 1500 + DEADBAND_US) {
+    out = map(pwmIn, 1500 + DEADBAND_US, 2000, THROTTLE_MIN_PWM, THROTTLE_MAX_PWM);
+    out = constrain(out, THROTTLE_MIN_PWM, THROTTLE_MAX_PWM);
+  }
+
+  analogWrite(PWM_OUT, out);
+
+  Serial.print("PWM in: "); Serial.print(pwmIn);
+  Serial.print(" | Out: "); Serial.print(out);
+  Serial.print(" (~"); Serial.print((out / 255.0) * 5.0, 2);
+  Serial.println("V)");
+
+  delay(20);
+}
