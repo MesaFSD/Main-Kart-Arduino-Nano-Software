@@ -1,0 +1,361 @@
+// ============================================================
+// FSD Main Kart - Throttle + Reverse + BrakeL Test
+//
+// Control style:
+//   CH2 up / +100   = forward throttle
+//   CH2 center      = stop / zero throttle
+//   CH2 down / -100 = reverse throttle
+//
+//   CH7 = 100       = BrakeL active
+//   CH7 = 0 or -100 = BrakeL inactive
+//
+// Signal chain:
+//   RadioMaster CH2
+//     -> RP3 receiver
+//     -> Pixhawk / ArduRover
+//     -> Pixhawk MAIN OUT 3
+//     -> Arduino Nano D5
+//
+//   RadioMaster CH7
+//     -> Pixhawk / ArduRover
+//     -> Pixhawk MAIN OUT 4
+//     -> Arduino Nano D7
+//
+// Outputs:
+//   Nano D9  -> EZkontrol throttle signal
+//   Nano D8  -> EZkontrol reverse white wire
+//   Nano D10 -> EZkontrol BrakeL signal wire
+//
+// Pixhawk parameters assumed:
+//   RCMAP_THROTTLE  = 2
+//   SERVO3_FUNCTION = Throttle
+//   SERVO3_MIN      = 1100
+//   SERVO3_TRIM     = 1500
+//   SERVO3_MAX      = 1900
+//
+//   SERVO4_FUNCTION = RCIN7
+//
+// Throttle calibration:
+//   EZkontrol starts responding around PWM 41.
+//   Therefore:
+//     center/deadband = 0 PWM
+//     first active throttle = 41 PWM
+//     max test throttle = 80 PWM
+//
+// Safety behavior:
+//   - If Pixhawk drive signal is lost, throttle goes to 0.
+//   - Center stick = throttle 0.
+//   - Direction changes are protected:
+//       forward -> reverse or reverse -> forward forces throttle to 0 first,
+//       waits at zero, then toggles reverse pin.
+//   - BrakeL active forces throttle to 0.
+//   - BrakeL is assumed active-low:
+//       HIGH = brake off
+//       LOW  = brake on
+// ============================================================
+
+
+// ---------------- Pin assignments ----------------
+#define DRIVE_IN          5     // Pixhawk MAIN OUT 3 signal -> Nano D5
+#define BRAKE_IN          7     // Pixhawk MAIN OUT 4 signal -> Nano D7
+
+#define THROTTLE_OUT      9     // Nano D9  -> EZkontrol throttle signal
+#define REVERSE_OUT       8     // Nano D8  -> EZkontrol reverse white wire
+#define BRAKE_L_OUT       10    // Nano D10 -> EZkontrol BrakeL signal wire
+
+
+// ---------------- Input calibration ----------------
+// Based on your QGC setup:
+//   SERVO3_MIN  = 1100
+//   SERVO3_TRIM = 1500
+//   SERVO3_MAX  = 1900
+#define PWM_REVERSE_MIN   1100
+#define PWM_CENTER        1500
+#define PWM_FORWARD_MAX   1900
+
+// Deadband around center so tiny stick noise does not command motion.
+#define DEADBAND_US       35
+
+
+// ---------------- Brake input calibration ----------------
+// CH7 is a 3-position switch: -100, 0, 100.
+// Only +100 should activate BrakeL.
+#define BRAKE_ACTIVE_THRESHOLD  1700   // >1700 us = brake request ON
+
+
+// ---------------- BrakeL output logic ----------------
+// BrakeL means active-low:
+//   HIGH = brake off / motor free to run
+//   LOW  = brake on
+#define BRAKE_OFF_LEVEL   HIGH
+#define BRAKE_ON_LEVEL    LOW
+
+
+// ---------------- Throttle output calibration ----------------
+// You found that the motor/controller does not really start moving
+// until about PWM 41. So active throttle maps from 41 to 80.
+// Center/deadband still outputs exactly 0.
+#define THROTTLE_PWM_ZERO       0
+#define THROTTLE_PWM_START      41    // first useful movement threshold
+#define THROTTLE_PWM_MAX        80    // safe test cap; raise later carefully
+
+
+// ---------------- Safety / smoothing ----------------
+#define RAMP_STEP         2       // PWM counts per loop. Lower = softer acceleration.
+#define LOOP_DELAY_MS     10      // Main loop delay.
+#define DIR_CHANGE_WAIT   700     // ms to wait at zero before switching direction.
+
+
+// ---------------- Direction state ----------------
+enum DriveDirection {
+  DIR_FORWARD,
+  DIR_REVERSE
+};
+
+DriveDirection activeDir = DIR_FORWARD;
+DriveDirection requestedDir = DIR_FORWARD;
+
+int currentThrottlePWM = 0;
+bool directionChangeInProgress = false;
+bool brakeActive = false;
+
+unsigned long zeroThrottleStartMs = 0;
+unsigned long lastPrintMs = 0;
+
+
+void setup() {
+  pinMode(DRIVE_IN, INPUT);
+  pinMode(BRAKE_IN, INPUT);
+
+  pinMode(THROTTLE_OUT, OUTPUT);
+  pinMode(REVERSE_OUT, OUTPUT);
+  pinMode(BRAKE_L_OUT, OUTPUT);
+
+  // Safe startup
+  analogWrite(THROTTLE_OUT, 0);
+  digitalWrite(REVERSE_OUT, LOW);             // LOW = forward, HIGH = reverse
+  digitalWrite(BRAKE_L_OUT, BRAKE_OFF_LEVEL); // Brake off by default
+
+  Serial.begin(115200);
+  delay(500);
+
+  Serial.println("============================================");
+  Serial.println(" FSD Main Kart - Throttle + Reverse + BrakeL");
+  Serial.println(" CH2 up / +100   = forward throttle");
+  Serial.println(" CH2 center      = stop");
+  Serial.println(" CH2 down / -100 = reverse throttle");
+  Serial.println(" CH7 +100        = BrakeL active");
+  Serial.println(" D5  = Pixhawk MAIN OUT 3 drive input");
+  Serial.println(" D7  = Pixhawk MAIN OUT 4 brake input");
+  Serial.println(" D9  = EZkontrol throttle output");
+  Serial.println(" D8  = EZkontrol reverse output");
+  Serial.println(" D10 = EZkontrol BrakeL output");
+  Serial.println(" BrakeL assumed ACTIVE-LOW: LOW = brake on");
+  Serial.println(" Throttle active range: 41 to 80 PWM");
+  Serial.println(" Center/deadband outputs 0 PWM");
+  Serial.println("============================================");
+}
+
+
+void loop() {
+  int pwmIn = pulseIn(DRIVE_IN, HIGH, 25000);
+  int brakeIn = pulseIn(BRAKE_IN, HIGH, 25000);
+
+  // ============================================================
+  // FAILSAFE: no drive signal from Pixhawk
+  // ============================================================
+  if (pwmIn == 0) {
+    currentThrottlePWM = 0;
+    analogWrite(THROTTLE_OUT, 0);
+
+    if (millis() - lastPrintMs > 500) {
+      lastPrintMs = millis();
+      Serial.println("[FAILSAFE] No Pixhawk drive PWM signal - throttle 0");
+    }
+
+    delay(LOOP_DELAY_MS);
+    return;
+  }
+
+
+  // ============================================================
+  // Read brake request from CH7 / MAIN OUT 4
+  // ============================================================
+  // If brake input is missing, treat brake as OFF for this test.
+  // If you want stricter safety later, change this to brakeActive = true.
+  if (brakeIn == 0) {
+    brakeActive = false;
+  } else {
+    brakeActive = (brakeIn > BRAKE_ACTIVE_THRESHOLD);
+  }
+
+  if (brakeActive) {
+    digitalWrite(BRAKE_L_OUT, BRAKE_ON_LEVEL);
+  } else {
+    digitalWrite(BRAKE_L_OUT, BRAKE_OFF_LEVEL);
+  }
+
+
+  // ============================================================
+  // Determine requested direction and target throttle from CH2
+  //
+  //   pwmIn HIGH / CH2 +100 / stick up   = FORWARD
+  //   pwmIn LOW  / CH2 -100 / stick down = REVERSE
+  //
+  // FINE TUNED:
+  //   If active throttle is requested, map to 41..80 PWM.
+  //   If inside deadband, output 0 PWM.
+  // ============================================================
+  int targetThrottlePWM = 0;
+
+  if (pwmIn > PWM_CENTER + DEADBAND_US) {
+    // Stick up / +100 = forward throttle
+    requestedDir = DIR_FORWARD;
+
+    targetThrottlePWM = map(
+      pwmIn,
+      PWM_CENTER + DEADBAND_US,
+      PWM_FORWARD_MAX,
+      THROTTLE_PWM_START,
+      THROTTLE_PWM_MAX
+    );
+
+    targetThrottlePWM = constrain(
+      targetThrottlePWM,
+      THROTTLE_PWM_START,
+      THROTTLE_PWM_MAX
+    );
+  }
+  else if (pwmIn < PWM_CENTER - DEADBAND_US) {
+    // Stick down / -100 = reverse throttle
+    requestedDir = DIR_REVERSE;
+
+    targetThrottlePWM = map(
+      pwmIn,
+      PWM_CENTER - DEADBAND_US,
+      PWM_REVERSE_MIN,
+      THROTTLE_PWM_START,
+      THROTTLE_PWM_MAX
+    );
+
+    targetThrottlePWM = constrain(
+      targetThrottlePWM,
+      THROTTLE_PWM_START,
+      THROTTLE_PWM_MAX
+    );
+  }
+  else {
+    // Center deadband = stop.
+    // Keep requested direction equal to active direction so sitting at center
+    // does not trigger direction changes.
+    targetThrottlePWM = THROTTLE_PWM_ZERO;
+    requestedDir = activeDir;
+  }
+
+
+  // ============================================================
+  // Brake protection
+  // ============================================================
+  // If brake is active, throttle must be zero.
+  if (brakeActive) {
+    targetThrottlePWM = THROTTLE_PWM_ZERO;
+  }
+
+
+  // ============================================================
+  // Direction-change protection
+  // ============================================================
+  if (requestedDir != activeDir && !directionChangeInProgress) {
+    directionChangeInProgress = true;
+    zeroThrottleStartMs = 0;
+
+    Serial.print("[DIR CHANGE REQUEST] ");
+    Serial.print(activeDir == DIR_FORWARD ? "FORWARD" : "REVERSE");
+    Serial.print(" -> ");
+    Serial.println(requestedDir == DIR_FORWARD ? "FORWARD" : "REVERSE");
+  }
+
+  // During direction change, force throttle target to zero.
+  if (directionChangeInProgress) {
+    targetThrottlePWM = THROTTLE_PWM_ZERO;
+  }
+
+
+  // ============================================================
+  // Smooth throttle ramping
+  // ============================================================
+  if (currentThrottlePWM < targetThrottlePWM) {
+    currentThrottlePWM += RAMP_STEP;
+
+    if (currentThrottlePWM > targetThrottlePWM) {
+      currentThrottlePWM = targetThrottlePWM;
+    }
+  }
+  else if (currentThrottlePWM > targetThrottlePWM) {
+    currentThrottlePWM -= RAMP_STEP;
+
+    if (currentThrottlePWM < targetThrottlePWM) {
+      currentThrottlePWM = targetThrottlePWM;
+    }
+  }
+
+  analogWrite(THROTTLE_OUT, currentThrottlePWM);
+
+
+  // ============================================================
+  // Complete direction change only after throttle reaches zero
+  // ============================================================
+  if (directionChangeInProgress && currentThrottlePWM == 0) {
+    if (zeroThrottleStartMs == 0) {
+      zeroThrottleStartMs = millis();
+      Serial.println("[DIR CHANGE] Throttle is 0. Waiting before switching reverse pin...");
+    }
+
+    if (millis() - zeroThrottleStartMs >= DIR_CHANGE_WAIT) {
+      activeDir = requestedDir;
+
+      if (activeDir == DIR_REVERSE) {
+        digitalWrite(REVERSE_OUT, HIGH);   // Reverse ON
+      } else {
+        digitalWrite(REVERSE_OUT, LOW);    // Forward ON
+      }
+
+      directionChangeInProgress = false;
+
+      Serial.print("[DIR CHANGE COMPLETE] Active direction: ");
+      Serial.println(activeDir == DIR_FORWARD ? "FORWARD" : "REVERSE");
+    }
+  }
+
+
+  // ============================================================
+  // Serial debug
+  // ============================================================
+  if (millis() - lastPrintMs > 200) {
+    lastPrintMs = millis();
+
+    float throttleVoltage = (currentThrottlePWM / 255.0) * 5.0;
+
+    Serial.print("Drive In: ");
+    Serial.print(pwmIn);
+    Serial.print(" us | Brake In: ");
+    Serial.print(brakeIn);
+    Serial.print(" us | Brake: ");
+    Serial.print(brakeActive ? "ON" : "OFF");
+    Serial.print(" | Requested: ");
+    Serial.print(requestedDir == DIR_FORWARD ? "FWD" : "REV");
+    Serial.print(" | Active: ");
+    Serial.print(activeDir == DIR_FORWARD ? "FWD" : "REV");
+    Serial.print(" | Changing: ");
+    Serial.print(directionChangeInProgress ? "YES" : "NO");
+    Serial.print(" | Throttle Out: ");
+    Serial.print(currentThrottlePWM);
+    Serial.print("/");
+    Serial.print(THROTTLE_PWM_MAX);
+    Serial.print(" (~");
+    Serial.print(throttleVoltage, 2);
+    Serial.println(" V)");
+  }
+
+  delay(LOOP_DELAY_MS);
+}
