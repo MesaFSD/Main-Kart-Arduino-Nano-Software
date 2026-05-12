@@ -1,0 +1,77 @@
+// ============================================================
+// REV Through Bore Encoder Test (REV-11-1271)
+// 2048 CPR, 8192 counts/rev in quadrature
+//
+// Wiring:
+//   Encoder RED    -> Nano 5V
+//   Encoder BLACK  -> Nano GND
+//   Encoder BLUE   -> Nano D2 (Channel A, INT0)
+//   Encoder YELLOW -> Nano D3 (Channel B, INT1)
+//
+// Encoder switch must be on 'A' (not 'S')
+// JST-PH pins 5/6 (Index, ABS) left unconnected
+//
+// Output: counts and degrees, updated 10x/sec
+// ============================================================
+
+#define ENC_A 2
+#define ENC_B 3
+#define COUNTS_PER_REV 8192
+
+volatile long encoderCount = 0;
+unsigned long lastPrintMs = 0;
+
+void encoderISR() {
+  int A = digitalRead(ENC_A);
+  int B = digitalRead(ENC_B);
+  static int lastA = LOW;
+  if (A != lastA) {
+    if (B != A) encoderCount++;
+    else encoderCount--;
+    lastA = A;
+  }
+}
+
+void setup() {
+  pinMode(ENC_A, INPUT_PULLUP);
+  pinMode(ENC_B, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_A), encoderISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_B), encoderISR, CHANGE);
+
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("============================================");
+  Serial.println("  REV Encoder Test");
+  Serial.println("  Turn the shaft, watch counts change.");
+  Serial.println("  Send 'z' over serial to zero the count.");
+  Serial.println("============================================");
+}
+
+void loop() {
+  // Zero on 'z' command
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'z' || c == 'Z') {
+      noInterrupts();
+      encoderCount = 0;
+      interrupts();
+      Serial.println(">> Count zeroed <<");
+    }
+  }
+
+  // Print at 10 Hz
+  if (millis() - lastPrintMs > 100) {
+    lastPrintMs = millis();
+
+    noInterrupts();
+    long count = encoderCount;
+    interrupts();
+
+    float degrees = (count / (float)COUNTS_PER_REV) * 360.0;
+    float revs = count / (float)COUNTS_PER_REV;
+
+    Serial.print("Count: ");   Serial.print(count);
+    Serial.print(" | Deg: ");  Serial.print(degrees, 1);
+    Serial.print(" | Rev: ");  Serial.println(revs, 3);
+  }
+}
