@@ -1,10 +1,15 @@
+# Steering Test
+<img width="587" height="299" alt="image" src="https://github.com/user-attachments/assets/2b938d16-3de4-498c-8317-2fde1f917827" />
+
+
 # Main-Kart-Arduino-Nano-Software
 Sketches for the arduino nano, main kart
 
 Wiring: 
 <img width="653" height="287" alt="image" src="https://github.com/user-attachments/assets/1a73c7b8-15a5-455f-a43b-cbdf1dd9e681" />
 
-Claude Context: 
+Claude
+Context: 
 FSD Autonomous Go-Kart — System Context (Current State)
 Project Identity
 MesaFSD autonomous go-kart for the AKS 2026 competition. Tier 1 MVP. Combines two parent platforms: the donkey car (proven autonomy stack) and the original RC kart (proven actuation stack).
