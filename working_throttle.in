@@ -1,0 +1,52 @@
+// ============================================================
+// THROTTLE SERIAL TEST WITH RAMP — Arduino Nano + EZkontrol
+// Ramps gradually from current to target PWM instead of jumping.
+// ============================================================
+
+#define THROTTLE_PIN 9
+#define RAMP_STEP 1      // PWM counts per step
+#define RAMP_DELAY_MS 10 // delay between steps
+
+int currentPWM = 0;
+int targetPWM = 0;
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(THROTTLE_PIN, OUTPUT);
+  analogWrite(THROTTLE_PIN, 0);
+  delay(500);
+  Serial.println("============================================");
+  Serial.println(" Throttle test with ramp. Output at PWM 0.");
+  Serial.println(" Enter 0-255 and press Enter.");
+  Serial.println(" Ramps at 1 PWM per 10ms (100 PWM/sec).");
+  Serial.println("============================================");
+}
+
+void loop() {
+  // Read serial input if available
+  if (Serial.available() > 0) {
+    int val = Serial.parseInt();
+    while (Serial.available() > 0) Serial.read();
+
+    if (val < 0) val = 0;
+    if (val > 255) val = 255;
+
+    targetPWM = val;
+    Serial.print("Target set to PWM ");
+    Serial.print(targetPWM);
+    Serial.print(" (~");
+    Serial.print((targetPWM / 255.0) * 5.0, 2);
+    Serial.println(" V)");
+  }
+
+  // Ramp current PWM toward target
+  if (currentPWM < targetPWM) {
+    currentPWM = min(currentPWM + RAMP_STEP, targetPWM);
+    analogWrite(THROTTLE_PIN, currentPWM);
+  } else if (currentPWM > targetPWM) {
+    currentPWM = max(currentPWM - RAMP_STEP, targetPWM);
+    analogWrite(THROTTLE_PIN, currentPWM);
+  }
+
+  delay(RAMP_DELAY_MS);
+}
