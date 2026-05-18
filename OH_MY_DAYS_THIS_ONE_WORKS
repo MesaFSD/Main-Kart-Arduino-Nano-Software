@@ -1,20 +1,18 @@
 // ============================================================
-// FSD Kart — Steering + Throttle RC Test
-// Uses hardware interrupts on D2/D3 for simultaneous capture
+// THE WORKING THROTTLE AND STEERING + ENCODER
+// FSD Kart — Steering + Throttle RC + ABS Encoder Limits
 //
 // Signal chain:
 //   RadioMaster → RP3 → Pixhawk → MAIN OUT 2 → Mega D2 → D6 → Talon SRX
 //   RadioMaster → RP3 → Pixhawk → MAIN OUT 3 → Mega D3 → D9 → EZkontrol
+//   REV Encoder ABS → Mega D4
 //
-// Encoder (REV-11-1271 ABS mode):
-//   Center = 204, Right limit = 398, Left limit = 65
-//   Test limits set at center +/- 50 (154 to 254)
-//   Switch must be on 'A' (ABI mode for ABS PWM output)
+// Pixhawk must be armed in MANUAL mode in QGC
 // ============================================================
 
 #include <Servo.h>
 
-// ── Pins ─────────────────────────────────────────────────────
+// Pins
 #define STEER_IN        2
 #define DRIVE_IN        3
 #define ENCODER_ABS     4
@@ -23,16 +21,16 @@
 #define THROTTLE_OUT    9
 #define BRAKE_OUT       10    // reserved
 
-// ── Steering tuning ──────────────────────────────────────────
+// Steering tuning
 #define SPEED_LIMIT     20
 #define STEER_DEADBAND  30
 
-// ── Encoder limits ───────────────────────────────────────────
+// Encoder limits
 #define ENCODER_CENTER  204
-#define ENCODER_LEFT    154   // center - 50 (test limit, true left = 65)
-#define ENCODER_RIGHT   254   // center + 50 (test limit, true right = 398)
+#define ENCODER_LEFT    90    // true left 65 + 25
+#define ENCODER_RIGHT   353   // true right 398 - 45
 
-// ── Throttle tuning ──────────────────────────────────────────
+// Throttle tuning
 #define PWM_CENTER          1500
 #define PWM_MAX             1900
 #define DEADBAND_US         35
@@ -40,15 +38,15 @@
 #define THROTTLE_PWM_START  41
 #define THROTTLE_PWM_MAX    80
 
-// ── Ramping ──────────────────────────────────────────────────
+// Ramping
 #define STEER_RAMP_STEP     15
 #define THROTTLE_RAMP_STEP  1
 
-// ── Failsafe ─────────────────────────────────────────────────
+// Failsafe
 #define FAILSAFE_MS         500
 #define LOOP_DELAY_MS       10
 
-// ── Interrupt PWM capture ────────────────────────────────────
+// Interrupt PWM capture
 volatile unsigned long steerRiseTime = 0;
 volatile unsigned long driveRiseTime = 0;
 volatile int steerPWM = 0;
@@ -68,7 +66,7 @@ void driveISR() {
     drivePWM = (int)(micros() - driveRiseTime);
 }
 
-// ── State ────────────────────────────────────────────────────
+// State
 Servo steering;
 int steerOut = 1500;
 int currentPWM = 0;
@@ -77,7 +75,7 @@ unsigned long lastSteerPulseMs = 0;
 unsigned long lastDrivePulseMs = 0;
 unsigned long lastPrintMs = 0;
 
-// ── Read ABS encoder ─────────────────────────────────────────
+// Read ABS encoder
 int readEncoder() {
   unsigned long pulse = pulseIn(ENCODER_ABS, HIGH, 3000);
   if (pulse == 0) return -1;
@@ -96,68 +94,55 @@ void setup() {
   pinMode(THROTTLE_OUT, OUTPUT);
   analogWrite(THROTTLE_OUT, 0);
 
-  // Reserved pins safe state
   pinMode(REVERSE_OUT, OUTPUT);
   digitalWrite(REVERSE_OUT, LOW);
   pinMode(BRAKE_OUT, OUTPUT);
-  digitalWrite(BRAKE_OUT, HIGH);  // active-LOW, HIGH = brake off
+  digitalWrite(BRAKE_OUT, HIGH);
 
   attachInterrupt(digitalPinToInterrupt(STEER_IN), steerISR, CHANGE);
   attachInterrupt(digitalPinToInterrupt(DRIVE_IN), driveISR, CHANGE);
 
-  // Force failsafe on boot
   lastSteerPulseMs = millis() - FAILSAFE_MS - 1;
   lastDrivePulseMs = millis() - FAILSAFE_MS - 1;
 
   delay(500);
   Serial.println("============================================");
   Serial.println(" FSD Kart — Steering + Throttle + Encoder");
-  Serial.println(" Test limits: LEFT=154 CENTER=204 RIGHT=254");
-  Serial.println(" True limits: LEFT=65  CENTER=204 RIGHT=398");
+  Serial.println(" Limits: LEFT=90 CENTER=204 RIGHT=353");
   Serial.println(" Arm Pixhawk in MANUAL mode.");
   Serial.println("============================================");
 }
 
 void loop() {
-  // Read interrupt values
   noInterrupts();
   int steerIn = steerPWM;
   int driveIn = drivePWM;
   interrupts();
 
-  // Read encoder
   int encVal = readEncoder();
 
-  // Validate pulses
   if (steerIn >= 900 && steerIn <= 2100) lastSteerPulseMs = millis();
   if (driveIn >= 900 && driveIn <= 2100) lastDrivePulseMs = millis();
 
-  // ── Throttle ─────────────────────────────────────────────
+  // Throttle
   if (millis() - lastDrivePulseMs > FAILSAFE_MS) {
     targetPWM = THROTTLE_PWM_ZERO;
   } else {
     if (driveIn > PWM_CENTER + DEADBAND_US) {
-      targetPWM = map(
-        driveIn,
-        PWM_CENTER + DEADBAND_US,
-        PWM_MAX,
-        THROTTLE_PWM_START,
-        THROTTLE_PWM_MAX
-      );
+      targetPWM = map(driveIn, PWM_CENTER + DEADBAND_US, PWM_MAX,
+                      THROTTLE_PWM_START, THROTTLE_PWM_MAX);
       targetPWM = constrain(targetPWM, THROTTLE_PWM_START, THROTTLE_PWM_MAX);
     } else {
       targetPWM = THROTTLE_PWM_ZERO;
     }
   }
-
   if (currentPWM < targetPWM)
     currentPWM = min(currentPWM + THROTTLE_RAMP_STEP, targetPWM);
   else if (currentPWM > targetPWM)
     currentPWM = max(currentPWM - THROTTLE_RAMP_STEP, targetPWM);
-
   analogWrite(THROTTLE_OUT, currentPWM);
 
-  // ── Steering ─────────────────────────────────────────────
+  // Steering
   if (millis() - lastSteerPulseMs > FAILSAFE_MS) {
     steering.writeMicroseconds(1500);
     steerOut = 1500;
@@ -167,28 +152,22 @@ void loop() {
     if (abs(steerIn - 1500) <= STEER_DEADBAND) {
       targetOut = 1500;
     } else {
-      int command = map(steerIn, 1000, 2000, 100, -100);
+      int command = map(steerIn, 1000, 2000, -100, 100);
       command = constrain(command, -SPEED_LIMIT, SPEED_LIMIT);
 
-      // ── Software encoder limits ───────────────────────
-      // Only apply if encoder is reading valid signal
       if (encVal > 0) {
-        // Past right limit — block further right movement
         if (encVal >= ENCODER_RIGHT && command > 0) command = 0;
-        // Past left limit — block further left movement
-        if (encVal <= ENCODER_LEFT && command < 0) command = 0;
+        if (encVal <= ENCODER_LEFT  && command < 0) command = 0;
       }
 
       targetOut = map(command, -100, 100, 1000, 2000);
     }
-
     if (steerOut < targetOut) steerOut = min(steerOut + STEER_RAMP_STEP, targetOut);
     else if (steerOut > targetOut) steerOut = max(steerOut - STEER_RAMP_STEP, targetOut);
-
     steering.writeMicroseconds(steerOut);
   }
 
-  // ── Serial debug ─────────────────────────────────────────
+  // Serial debug
   if (millis() - lastPrintMs > 200) {
     lastPrintMs = millis();
     Serial.print("ST in: "); Serial.print(steerIn);
