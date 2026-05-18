@@ -1,13 +1,15 @@
 // ============================================================
-// THE WORKING THROTTLE AND STEERING + ENCODER
-// FSD Kart — Steering + Throttle RC + ABS Encoder Limits
+// THE WORKING THROTTLE AND STEERING + ENCODER + BRAKE
+// FSD Kart — Steering + Throttle RC + ABS Encoder + Brake
 //
 // Signal chain:
 //   RadioMaster → RP3 → Pixhawk → MAIN OUT 2 → Mega D2 → D6 → Talon SRX
 //   RadioMaster → RP3 → Pixhawk → MAIN OUT 3 → Mega D3 → D9 → EZkontrol
+//   RadioMaster → RP3 → Pixhawk → MAIN OUT 4 → Mega D24 → D10 → EZkontrol BrakeL
 //   REV Encoder ABS → Mega D4
 //
 // Pixhawk must be armed in MANUAL mode in QGC
+// SERVO4_FUNCTION = RCIN7
 // ============================================================
 
 #include <Servo.h>
@@ -19,7 +21,8 @@
 #define STEER_OUT       6
 #define REVERSE_OUT     8     // reserved
 #define THROTTLE_OUT    9
-#define BRAKE_OUT       10    // reserved
+#define BRAKE_L_OUT     10    // active-LOW → EZkontrol BrakeL
+#define BRAKE_IN        24    // Pixhawk MAIN OUT 4 → CH7
 
 // Steering tuning
 #define SPEED_LIMIT     20
@@ -37,6 +40,9 @@
 #define THROTTLE_PWM_ZERO   0
 #define THROTTLE_PWM_START  41
 #define THROTTLE_PWM_MAX    80
+
+// Brake tuning
+#define BRAKE_THRESHOLD     1700  // above = brake on, below = brake off
 
 // Ramping
 #define STEER_RAMP_STEP     15
@@ -71,6 +77,7 @@ Servo steering;
 int steerOut = 1500;
 int currentPWM = 0;
 int targetPWM = 0;
+bool brakeEngaged = false;
 unsigned long lastSteerPulseMs = 0;
 unsigned long lastDrivePulseMs = 0;
 unsigned long lastPrintMs = 0;
@@ -91,13 +98,14 @@ void setup() {
   pinMode(STEER_IN, INPUT);
   pinMode(DRIVE_IN, INPUT);
   pinMode(ENCODER_ABS, INPUT);
+  pinMode(BRAKE_IN, INPUT);
   pinMode(THROTTLE_OUT, OUTPUT);
   analogWrite(THROTTLE_OUT, 0);
 
   pinMode(REVERSE_OUT, OUTPUT);
   digitalWrite(REVERSE_OUT, LOW);
-  pinMode(BRAKE_OUT, OUTPUT);
-  digitalWrite(BRAKE_OUT, HIGH);
+  pinMode(BRAKE_L_OUT, OUTPUT);
+  digitalWrite(BRAKE_L_OUT, HIGH);  // active-LOW, HIGH = brake off on boot
 
   attachInterrupt(digitalPinToInterrupt(STEER_IN), steerISR, CHANGE);
   attachInterrupt(digitalPinToInterrupt(DRIVE_IN), driveISR, CHANGE);
@@ -107,8 +115,9 @@ void setup() {
 
   delay(500);
   Serial.println("============================================");
-  Serial.println(" FSD Kart — Steering + Throttle + Encoder");
+  Serial.println(" FSD Kart — Steering + Throttle + Encoder + Brake");
   Serial.println(" Limits: LEFT=90 CENTER=204 RIGHT=353");
+  Serial.println(" CH7 flip → throttle ramps to 0 → BrakeL activates");
   Serial.println(" Arm Pixhawk in MANUAL mode.");
   Serial.println("============================================");
 }
@@ -121,28 +130,53 @@ void loop() {
 
   int encVal = readEncoder();
 
+  // Read brake channel
+  int brakeIn = pulseIn(BRAKE_IN, HIGH, 25000);
+  bool brakeRequested = (brakeIn > BRAKE_THRESHOLD);
+
   if (steerIn >= 900 && steerIn <= 2100) lastSteerPulseMs = millis();
   if (driveIn >= 900 && driveIn <= 2100) lastDrivePulseMs = millis();
 
-  // Throttle
-  if (millis() - lastDrivePulseMs > FAILSAFE_MS) {
+  // ── Brake logic ──────────────────────────────────────────
+  if (brakeRequested) {
+    // Step 1: ramp throttle to zero
     targetPWM = THROTTLE_PWM_ZERO;
-  } else {
-    if (driveIn > PWM_CENTER + DEADBAND_US) {
-      targetPWM = map(driveIn, PWM_CENTER + DEADBAND_US, PWM_MAX,
-                      THROTTLE_PWM_START, THROTTLE_PWM_MAX);
-      targetPWM = constrain(targetPWM, THROTTLE_PWM_START, THROTTLE_PWM_MAX);
-    } else {
-      targetPWM = THROTTLE_PWM_ZERO;
+    if (currentPWM > 0) {
+      currentPWM = max(currentPWM - THROTTLE_RAMP_STEP, 0);
+      analogWrite(THROTTLE_OUT, currentPWM);
     }
-  }
-  if (currentPWM < targetPWM)
-    currentPWM = min(currentPWM + THROTTLE_RAMP_STEP, targetPWM);
-  else if (currentPWM > targetPWM)
-    currentPWM = max(currentPWM - THROTTLE_RAMP_STEP, targetPWM);
-  analogWrite(THROTTLE_OUT, currentPWM);
+    // Step 2: only engage BrakeL once throttle is fully at zero
+    if (currentPWM == 0) {
+      digitalWrite(BRAKE_L_OUT, LOW);   // active-LOW = brake on
+      brakeEngaged = true;
+    }
+  } else {
+    // Brake released
+    if (brakeEngaged) {
+      digitalWrite(BRAKE_L_OUT, HIGH);  // brake off
+      brakeEngaged = false;
+    }
 
-  // Steering
+    // ── Throttle (only when brake not active) ─────────────
+    if (millis() - lastDrivePulseMs > FAILSAFE_MS) {
+      targetPWM = THROTTLE_PWM_ZERO;
+    } else {
+      if (driveIn > PWM_CENTER + DEADBAND_US) {
+        targetPWM = map(driveIn, PWM_CENTER + DEADBAND_US, PWM_MAX,
+                        THROTTLE_PWM_START, THROTTLE_PWM_MAX);
+        targetPWM = constrain(targetPWM, THROTTLE_PWM_START, THROTTLE_PWM_MAX);
+      } else {
+        targetPWM = THROTTLE_PWM_ZERO;
+      }
+    }
+    if (currentPWM < targetPWM)
+      currentPWM = min(currentPWM + THROTTLE_RAMP_STEP, targetPWM);
+    else if (currentPWM > targetPWM)
+      currentPWM = max(currentPWM - THROTTLE_RAMP_STEP, targetPWM);
+    analogWrite(THROTTLE_OUT, currentPWM);
+  }
+
+  // ── Steering ─────────────────────────────────────────────
   if (millis() - lastSteerPulseMs > FAILSAFE_MS) {
     steering.writeMicroseconds(1500);
     steerOut = 1500;
@@ -167,7 +201,7 @@ void loop() {
     steering.writeMicroseconds(steerOut);
   }
 
-  // Serial debug
+  // ── Serial debug ─────────────────────────────────────────
   if (millis() - lastPrintMs > 200) {
     lastPrintMs = millis();
     Serial.print("ST in: "); Serial.print(steerIn);
@@ -175,6 +209,8 @@ void loop() {
     Serial.print(" | ENC: "); Serial.print(encVal);
     Serial.print(" | TH in: "); Serial.print(driveIn);
     Serial.print(" | TH out: "); Serial.print(currentPWM);
+    Serial.print(" | BRK in: "); Serial.print(brakeIn);
+    Serial.print(" | BRK: "); Serial.print(brakeEngaged ? "ON" : "OFF");
     Serial.print(" (~"); Serial.print((currentPWM / 255.0) * 5.0, 2);
     Serial.println(" V)");
   }
